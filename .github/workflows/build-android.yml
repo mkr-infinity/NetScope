@@ -1,0 +1,198 @@
+name: Build Android Release APK
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options: [release, debug]
+
+concurrency:
+  group: android-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-android:
+    name: Build Signed Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Java 17 (required for Gradle 8+) ─────────────────────────────────
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      # ── 3. Android SDK ───────────────────────────────────────────────────────
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      # ── 4. Node.js ───────────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── 5. pnpm ──────────────────────────────────────────────────────────────
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+          run_install: false
+
+      # ── 6. Cache pnpm store ──────────────────────────────────────────────────
+      - name: Get pnpm store directory
+        id: pnpm-cache
+        shell: bash
+        run: echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_OUTPUT
+
+      - name: Cache pnpm modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-cache.outputs.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      # ── 7. Cache Gradle ──────────────────────────────────────────────────────
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches
+          key: ${{ runner.os }}-gradle-${{ hashFiles('artifacts/netscope/android/**/*.gradle*', 'artifacts/netscope/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ── 8. Install workspace dependencies ────────────────────────────────────
+      # frozen-lockfile installs from the lockfile — it only reads existing
+      # package versions, so minimumReleaseAge does not apply here.
+      - name: Install workspace dependencies
+        run: pnpm install --frozen-lockfile
+
+      # ── 9. Keystore: decode from secret or generate temp ─────────────────────
+      - name: Prepare keystore
+        id: keystore
+        working-directory: artifacts/netscope
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "🔑 Using keystore from GitHub secret KEYSTORE_BASE64..."
+            echo "$KEYSTORE_BASE64" | base64 --decode > netscope-release.keystore
+            {
+              echo "STORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEY_ALIAS_VALUE=$KEY_ALIAS"
+              echo "KEY_PASSWORD_VALUE=$KEY_PASSWORD"
+            } >> $GITHUB_ENV
+            echo "keystore_source=secret" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️  KEYSTORE_BASE64 secret not found — generating a temporary keystore."
+            echo "   See GITHUB_ACTIONS_SETUP.md to configure a permanent key."
+            keytool -genkeypair -v \
+              -keystore netscope-release.keystore \
+              -alias netscope-key \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass tmpNetscope2024 -keypass tmpNetscope2024 \
+              -dname "CN=NetScope, OU=Mobile, O=MKR Infinity, L=Unknown, ST=Unknown, C=US" \
+              -noprompt
+            {
+              echo "STORE_PASSWORD=tmpNetscope2024"
+              echo "KEY_ALIAS_VALUE=netscope-key"
+              echo "KEY_PASSWORD_VALUE=tmpNetscope2024"
+            } >> $GITHUB_ENV
+            echo "keystore_source=generated-temp" >> $GITHUB_OUTPUT
+          fi
+
+          # Verify keystore is readable
+          keytool -list -keystore netscope-release.keystore \
+            -storepass "${STORE_PASSWORD:-tmpNetscope2024}" -noprompt
+          echo "✅ Keystore ready."
+
+      # ── 10. Expo Prebuild ─────────────────────────────────────────────────────
+      - name: Run expo prebuild (generate Android native project)
+        working-directory: artifacts/netscope
+        run: |
+          pnpm exec expo prebuild \
+            --platform android \
+            --clean \
+            --no-install
+
+      # ── 11. Patch build.gradle with release signing ───────────────────────────
+      - name: Inject release signing config into build.gradle
+        working-directory: artifacts/netscope
+        run: |
+          node scripts/patch-gradle-signing.js \
+            --keystore "$(pwd)/netscope-release.keystore" \
+            --store-password "$STORE_PASSWORD" \
+            --key-alias "$KEY_ALIAS_VALUE" \
+            --key-password "$KEY_PASSWORD_VALUE"
+
+      # ── 12. Make Gradle wrapper executable ───────────────────────────────────
+      - name: Make gradlew executable
+        working-directory: artifacts/netscope/android
+        run: chmod +x gradlew
+
+      # ── 13. Build release APK ─────────────────────────────────────────────────
+      - name: Build release APK
+        working-directory: artifacts/netscope/android
+        run: |
+          ./gradlew assembleRelease \
+            --no-daemon \
+            --build-cache \
+            -Pandroid.enableBuildCache=true \
+            -PenableProguardInReleaseBuilds=false \
+            --stacktrace
+        env:
+          GRADLE_OPTS: "-Xmx4096m -XX:MaxMetaspaceSize=512m -Dfile.encoding=UTF-8"
+
+      # ── 14. Locate, rename and stage APK ─────────────────────────────────────
+      - name: Locate and rename APK
+        working-directory: artifacts/netscope
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "❌ No APK found — check Gradle output above."
+            find android/app/build/outputs -type f 2>/dev/null | head -30
+            exit 1
+          fi
+
+          VERSION=$(node -e "const a=require('./app.json'); console.log(a.expo.version)")
+          BUILD_NUM=${{ github.run_number }}
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          NEW_NAME="NetScope-v${VERSION}-build${BUILD_NUM}-${SHORT_SHA}.apk"
+
+          cp "$APK" "$NEW_NAME"
+          SIZE=$(du -sh "$NEW_NAME" | cut -f1)
+
+          echo "APK_PATH=$(pwd)/$NEW_NAME" >> $GITHUB_ENV
+          echo "APK_NAME=$NEW_NAME"        >> $GITHUB_ENV
+
+          echo "✅ APK: $NEW_NAME ($SIZE)"
+
+      # ── 15. Upload APK artifact ───────────────────────────────────────────────
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APK_NAME }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+          compression-level: 0   # APKs are already compressed
+
+      

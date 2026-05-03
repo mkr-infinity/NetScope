@@ -1,0 +1,27 @@
+kind = "mobile"
+previewPath = "/"
+title = "NetScope"
+version = "1.0.0"
+id = "artifacts/netscope"
+router = "expo-domain"
+
+[[integratedSkills]]
+name = "expo"
+version = "1.0.0"
+
+[[services]]
+ensurePreviewReachable = "/status"
+name = "expo"
+paths = [ "/" ]
+localPort = 26015
+
+[services.development]
+run = "pnpm --filter @workspace/netscope run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/netscope", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/netscope", "run", "serve" ]
+
+[services.env]
+PORT = "26015"
+BASE_PATH = "/"
